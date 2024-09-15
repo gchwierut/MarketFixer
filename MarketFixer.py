@@ -1,6 +1,8 @@
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import os
+import time
+import requests
 
 # Define client ID, client secret, and redirect URI
 client_id = "yourclientid"
@@ -16,11 +18,44 @@ sp = spotipy.Spotify(auth_manager=SpotifyOAuth(client_id=client_id,
                                                redirect_uri=redirect_uri,
                                                scope=scope))
 
+# Rate limiter settings
+MAX_CALLS_PER_MINUTE = 180
+call_count = 0
+start_time = time.time()
+
+def rate_limiter():
+    global call_count, start_time
+    call_count += 1
+    if call_count >= MAX_CALLS_PER_MINUTE:
+        elapsed_time = time.time() - start_time
+        if elapsed_time < 60:
+            time_to_wait = 60 - elapsed_time
+            print(f"Rate limit reached. Waiting for {time_to_wait:.2f} seconds.")
+            time.sleep(time_to_wait)
+        call_count = 0
+        start_time = time.time()
+
+def handle_429_error(response):
+    retry_after = int(response.headers.get("Retry-After", 1))  # Default to 1 second if no header
+    print(f"429 error encountered. Retrying after {retry_after} seconds.")
+    time.sleep(retry_after)
+
+def safe_spotify_call(func, *args, **kwargs):
+    while True:
+        try:
+            rate_limiter()  # Ensure rate limiting
+            return func(*args, **kwargs)
+        except spotipy.SpotifyException as e:
+            if e.http_status == 429:
+                handle_429_error(e.http_response)
+            else:
+                raise e
+
 # Get the user's playlists
 offset = 0
 playlists = []
 while True:
-    results = sp.current_user_playlists(offset=offset)
+    results = safe_spotify_call(sp.current_user_playlists, offset=offset)
     playlists += results["items"]
     if results["next"] is None:
         break
@@ -38,13 +73,13 @@ playlist_choice = input("Enter the number of the playlist you want to modify: ")
 playlist_id = playlists[int(playlist_choice)-1]["id"]
 
 # Use Spotipy client to get the user's country
-user_country = sp.current_user()["country"]
+user_country = safe_spotify_call(sp.current_user)["country"]
 
 # Use Spotipy client to get all the tracks in the playlist
 playlist_tracks = []
 offset = 0
 while True:
-    results = sp.playlist_items(playlist_id, offset=offset)
+    results = safe_spotify_call(sp.playlist_items, playlist_id, offset=offset)
     playlist_tracks += results["items"]
     if results["next"] is None:
         break
@@ -66,20 +101,20 @@ for i in range(last_processed_track_index, len(playlist_tracks)):
     track_id = track["track"]["id"]
     
     # Check if track is available in user's country
-    track_info = sp.track(track_id)
+    track_info = safe_spotify_call(sp.track, track_id)
     available_markets = track_info["available_markets"]
     if user_country not in available_markets:
         # Search for a replacement track by the same artist
         query = f'artist:{artist_name} track:{track_name.split(" - ")[0]}'
-        results = sp.search(query, limit=1, type='track')
+        results = safe_spotify_call(sp.search, query, limit=1, type='track')
 
         # Check if a replacement track was found
         if len(results["tracks"]["items"]) > 0:
             replacement_track_id = results["tracks"]["items"][0]["id"]
 
             # Replace the unavailable track with the replacement track at the same index
-            sp.playlist_remove_specific_occurrences_of_items(playlist_id, [{ "uri": track["track"]["uri"], "positions": [i] }])
-            sp.playlist_add_items(playlist_id, [replacement_track_id], position=i)
+            safe_spotify_call(sp.playlist_remove_specific_occurrences_of_items, playlist_id, [{ "uri": track["track"]["uri"], "positions": [i] }])
+            safe_spotify_call(sp.playlist_add_items, playlist_id, [replacement_track_id], position=i)
 
             # Print a message indicating that the track has been replaced
             print(f"Track '{track_name}' by '{artist_name}' has been replaced with '{results['tracks']['items'][0]['name']}'")
@@ -94,4 +129,3 @@ for i in range(last_processed_track_index, len(playlist_tracks)):
     # Save the current track index to a file
     with open("last_track_index.txt", "w") as f:
         f.write(str(i))
-
